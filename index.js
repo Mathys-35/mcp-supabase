@@ -326,6 +326,78 @@ app.delete("/mcp", authMiddleware, async (req, res) => {
   }
 });
 
+// --- REST API (for agents schedule that can't use MCP transport yet) ---
+
+app.get("/api/read_rows", authMiddleware, async (req, res) => {
+  try {
+    const { table, select, order, limit, ...filters } = req.query;
+    if (!table) return res.status(400).json({ error: "table is required" });
+    let path = `/${encodeURIComponent(table)}?select=${select || "*"}`;
+    const filterQuery = buildFilterQuery(filters);
+    if (filterQuery) path += `&${filterQuery}`;
+    if (order) path += `&order=${encodeURIComponent(order)}`;
+    if (limit) path += `&limit=${limit}`;
+    const data = await supabaseRequest("GET", path);
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/insert_rows", authMiddleware, async (req, res) => {
+  try {
+    const { table, rows, return_rows } = req.body;
+    if (!table || !rows)
+      return res.status(400).json({ error: "table and rows are required" });
+    const path = `/${encodeURIComponent(table)}`;
+    const headers = {};
+    headers["Prefer"] = return_rows ? "return=representation" : "return=minimal";
+    const data = await supabaseRequest("POST", path, { headers, body: rows });
+    res.json(return_rows ? data : { ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch("/api/update_rows", authMiddleware, async (req, res) => {
+  try {
+    const { table, filters, data: updateData, return_rows } = req.body;
+    if (!table || !filters || !updateData)
+      return res
+        .status(400)
+        .json({ error: "table, filters and data are required" });
+    let path = `/${encodeURIComponent(table)}?`;
+    path += buildFilterQuery(filters);
+    const headers = {};
+    headers["Prefer"] = return_rows ? "return=representation" : "return=minimal";
+    const result = await supabaseRequest("PATCH", path, {
+      headers,
+      body: updateData,
+    });
+    res.json(return_rows ? result : { ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/count_rows", authMiddleware, async (req, res) => {
+  try {
+    const { table, ...filters } = req.query;
+    if (!table) return res.status(400).json({ error: "table is required" });
+    let path = `/${encodeURIComponent(table)}?select=count`;
+    const filterQuery = buildFilterQuery(filters);
+    if (filterQuery) path += `&${filterQuery}`;
+    const data = await supabaseRequest("GET", path, {
+      headers: { Prefer: "count=exact" },
+    });
+    const count =
+      Array.isArray(data) && data[0] ? data[0].count : "unknown";
+    res.json({ count });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --- Start ---
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`MCP Supabase server running on port ${PORT}`);
