@@ -303,17 +303,28 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) => {
 });
 
 // Dynamic client registration (MCP spec requirement)
+// Stores registered clients so the connector can use its own generated credentials
+const registeredClients = new Map();
+
 app.post("/oauth/register", (req, res) => {
-  // Auto-approve registration, return the configured client credentials
-  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
-    return res.status(500).json({ error: "server_error" });
-  }
+  // Generate a client_id and client_secret for this registration
+  const clientId = req.body.client_id || crypto.randomBytes(16).toString("hex");
+  const clientSecret = crypto.randomBytes(32).toString("hex");
+
+  registeredClients.set(clientId, {
+    clientSecret,
+    redirectUris: req.body.redirect_uris || [],
+    clientName: req.body.client_name || "MCP Client",
+  });
+
+  console.log(`OAuth: registered client ${clientId}`);
+
   res.status(201).json({
-    client_id: OAUTH_CLIENT_ID,
-    client_secret: OAUTH_CLIENT_SECRET,
+    client_id: clientId,
+    client_secret: clientSecret,
     client_name: req.body.client_name || "MCP Client",
     redirect_uris: req.body.redirect_uris || [],
-    grant_types: ["authorization_code", "client_credentials"],
+    grant_types: ["authorization_code"],
     response_types: ["code"],
     token_endpoint_auth_method: "client_secret_post",
   });
@@ -327,9 +338,15 @@ app.get("/authorize", (req, res) => {
     return res.status(400).json({ error: "unsupported_response_type" });
   }
 
-  if (client_id !== OAUTH_CLIENT_ID) {
+  // Accept configured client OR dynamically registered clients
+  const isConfiguredClient = client_id === OAUTH_CLIENT_ID;
+  const isRegisteredClient = registeredClients.has(client_id);
+  if (!isConfiguredClient && !isRegisteredClient) {
+    console.log(`OAuth: rejected unknown client_id ${client_id}`);
     return res.status(401).json({ error: "invalid_client" });
   }
+
+  console.log(`OAuth: authorize for client ${client_id}, redirect to ${redirect_uri}`);
 
   // Generate authorization code
   const code = crypto.randomBytes(32).toString("hex");
@@ -408,7 +425,11 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
 
   // --- Client credentials flow ---
   if (grantType === "client_credentials") {
-    if (clientId !== OAUTH_CLIENT_ID || clientSecret !== OAUTH_CLIENT_SECRET) {
+    // Accept configured client OR dynamically registered clients
+    const isConfigured = clientId === OAUTH_CLIENT_ID && clientSecret === OAUTH_CLIENT_SECRET;
+    const registered = registeredClients.get(clientId);
+    const isRegistered = registered && registered.clientSecret === clientSecret;
+    if (!isConfigured && !isRegistered) {
       return res.status(401).json({ error: "invalid_client" });
     }
     const { token, expiresIn } = issueOAuthToken();
@@ -430,8 +451,8 @@ app.get("/sse", authMiddleware, async (req, res) => {
   };
 
   const server = createMcpServer();
+  // connect() calls start() internally, don't call start() separately
   await server.connect(transport);
-  await transport.start();
 });
 
 app.post("/messages", authMiddleware, async (req, res) => {
