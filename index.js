@@ -9,17 +9,45 @@ const {
 } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { z } = require("zod");
 
+const crypto = require("node:crypto");
+
 // --- Config ---
 const PORT = process.env.PORT || 3100;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !MCP_AUTH_TOKEN) {
   console.error(
     "Missing required env vars: SUPABASE_URL, SUPABASE_SERVICE_KEY, MCP_AUTH_TOKEN"
   );
   process.exit(1);
+}
+
+// --- OAuth token store (in-memory, tokens expire after 1h) ---
+const oauthTokens = new Map();
+
+function issueOAuthToken() {
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = Date.now() + 3600 * 1000;
+  oauthTokens.set(token, expiresAt);
+  // Cleanup expired tokens
+  for (const [t, exp] of oauthTokens) {
+    if (exp < Date.now()) oauthTokens.delete(t);
+  }
+  return { token, expiresIn: 3600 };
+}
+
+function isValidOAuthToken(token) {
+  const exp = oauthTokens.get(token);
+  if (!exp) return false;
+  if (exp < Date.now()) {
+    oauthTokens.delete(token);
+    return false;
+  }
+  return true;
 }
 
 const SUPABASE_REST_URL = SUPABASE_URL.replace(/\/$/, "") + "/rest/v1";
@@ -231,17 +259,17 @@ function createMcpServer() {
   return server;
 }
 
-// --- Auth middleware ---
+// --- Auth middleware (accepts static MCP_AUTH_TOKEN or OAuth-issued tokens) ---
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).json({ error: "Missing or invalid Authorization header" });
   }
   const token = authHeader.slice(7);
-  if (token !== MCP_AUTH_TOKEN) {
-    return res.status(403).json({ error: "Invalid token" });
+  if (token === MCP_AUTH_TOKEN || isValidOAuthToken(token)) {
+    return next();
   }
-  next();
+  return res.status(403).json({ error: "Invalid token" });
 }
 
 // --- Express app ---
@@ -251,6 +279,59 @@ app.use(express.json());
 // Health check (no auth)
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", server: "mcp-supabase-sylion" });
+});
+
+// --- OAuth 2.0 endpoints (for Anthropic MCP connector) ---
+
+// Discovery document
+app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+  const baseUrl = `https://mcp-supabase.sylion.fr`;
+  res.json({
+    issuer: baseUrl,
+    token_endpoint: `${baseUrl}/oauth/token`,
+    token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+    grant_types_supported: ["client_credentials"],
+    response_types_supported: ["token"],
+    scopes_supported: ["mcp:tools"],
+  });
+});
+
+// Token endpoint (client credentials flow)
+app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => {
+  // Support both POST body and Basic auth
+  let clientId, clientSecret;
+
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Basic ")) {
+    const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
+    const parts = decoded.split(":");
+    clientId = parts[0];
+    clientSecret = parts.slice(1).join(":");
+  } else {
+    clientId = req.body.client_id;
+    clientSecret = req.body.client_secret;
+  }
+
+  const grantType = req.body.grant_type;
+
+  if (grantType !== "client_credentials") {
+    return res.status(400).json({ error: "unsupported_grant_type" });
+  }
+
+  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
+    return res.status(500).json({ error: "server_error", error_description: "OAuth not configured" });
+  }
+
+  if (clientId !== OAUTH_CLIENT_ID || clientSecret !== OAUTH_CLIENT_SECRET) {
+    return res.status(401).json({ error: "invalid_client" });
+  }
+
+  const { token, expiresIn } = issueOAuthToken();
+  res.json({
+    access_token: token,
+    token_type: "bearer",
+    expires_in: expiresIn,
+  });
 });
 
 // --- SSE transport (legacy, for mcp-remote compatibility) ---
