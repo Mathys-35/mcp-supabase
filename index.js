@@ -283,30 +283,82 @@ app.get("/health", (_req, res) => {
 
 // --- OAuth 2.0 endpoints (for Anthropic MCP connector) ---
 
+// Authorization codes store (code -> { clientId, redirectUri, codeChallenge, codeChallengeMethod, expiresAt })
+const authCodes = new Map();
+
 // Discovery document
 app.get("/.well-known/oauth-authorization-server", (_req, res) => {
   const baseUrl = `https://mcp-supabase.sylion.fr`;
   res.json({
     issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/authorize`,
     token_endpoint: `${baseUrl}/oauth/token`,
+    registration_endpoint: `${baseUrl}/oauth/register`,
     token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
-    grant_types_supported: ["client_credentials"],
-    response_types_supported: ["token"],
+    grant_types_supported: ["authorization_code", "client_credentials"],
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256", "plain"],
     scopes_supported: ["mcp:tools"],
   });
 });
 
-// Token endpoint (client credentials flow)
+// Dynamic client registration (MCP spec requirement)
+app.post("/oauth/register", (req, res) => {
+  // Auto-approve registration, return the configured client credentials
+  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
+    return res.status(500).json({ error: "server_error" });
+  }
+  res.status(201).json({
+    client_id: OAUTH_CLIENT_ID,
+    client_secret: OAUTH_CLIENT_SECRET,
+    client_name: req.body.client_name || "MCP Client",
+    redirect_uris: req.body.redirect_uris || [],
+    grant_types: ["authorization_code", "client_credentials"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "client_secret_post",
+  });
+});
+
+// Authorization endpoint (auto-approves and redirects with code)
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
+
+  if (response_type !== "code") {
+    return res.status(400).json({ error: "unsupported_response_type" });
+  }
+
+  if (client_id !== OAUTH_CLIENT_ID) {
+    return res.status(401).json({ error: "invalid_client" });
+  }
+
+  // Generate authorization code
+  const code = crypto.randomBytes(32).toString("hex");
+  authCodes.set(code, {
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    codeChallenge: code_challenge,
+    codeChallengeMethod: code_challenge_method || "plain",
+    expiresAt: Date.now() + 60 * 1000, // 1 min
+  });
+
+  // Auto-approve: redirect immediately with code
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set("code", code);
+  if (state) redirectUrl.searchParams.set("state", state);
+  res.redirect(302, redirectUrl.toString());
+});
+
+// Token endpoint (authorization code + client credentials flows)
 app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => {
-  // Support both POST body and Basic auth
   let clientId, clientSecret;
 
+  // Extract client credentials (Basic auth or POST body)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Basic ")) {
     const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
     const parts = decoded.split(":");
-    clientId = parts[0];
-    clientSecret = parts.slice(1).join(":");
+    clientId = decodeURIComponent(parts[0]);
+    clientSecret = decodeURIComponent(parts.slice(1).join(":"));
   } else {
     clientId = req.body.client_id;
     clientSecret = req.body.client_secret;
@@ -314,24 +366,56 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
 
   const grantType = req.body.grant_type;
 
-  if (grantType !== "client_credentials") {
-    return res.status(400).json({ error: "unsupported_grant_type" });
-  }
-
   if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
-    return res.status(500).json({ error: "server_error", error_description: "OAuth not configured" });
+    return res.status(500).json({ error: "server_error" });
   }
 
-  if (clientId !== OAUTH_CLIENT_ID || clientSecret !== OAUTH_CLIENT_SECRET) {
-    return res.status(401).json({ error: "invalid_client" });
+  // --- Authorization code flow ---
+  if (grantType === "authorization_code") {
+    const { code, redirect_uri, code_verifier } = req.body;
+    const stored = authCodes.get(code);
+
+    if (!stored || stored.expiresAt < Date.now()) {
+      authCodes.delete(code);
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+
+    // Verify PKCE code_verifier if code_challenge was provided
+    if (stored.codeChallenge) {
+      let valid = false;
+      if (stored.codeChallengeMethod === "S256") {
+        const hash = crypto.createHash("sha256").update(code_verifier || "").digest("base64url");
+        valid = hash === stored.codeChallenge;
+      } else {
+        valid = code_verifier === stored.codeChallenge;
+      }
+      if (!valid) {
+        authCodes.delete(code);
+        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+      }
+    }
+
+    // Verify redirect_uri matches
+    if (stored.redirectUri && redirect_uri !== stored.redirectUri) {
+      authCodes.delete(code);
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+
+    authCodes.delete(code);
+    const { token, expiresIn } = issueOAuthToken();
+    return res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
   }
 
-  const { token, expiresIn } = issueOAuthToken();
-  res.json({
-    access_token: token,
-    token_type: "bearer",
-    expires_in: expiresIn,
-  });
+  // --- Client credentials flow ---
+  if (grantType === "client_credentials") {
+    if (clientId !== OAUTH_CLIENT_ID || clientSecret !== OAUTH_CLIENT_SECRET) {
+      return res.status(401).json({ error: "invalid_client" });
+    }
+    const { token, expiresIn } = issueOAuthToken();
+    return res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
+  }
+
+  return res.status(400).json({ error: "unsupported_grant_type" });
 });
 
 // --- SSE transport (legacy, for mcp-remote compatibility) ---
