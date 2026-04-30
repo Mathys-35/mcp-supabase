@@ -18,6 +18,7 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
+const BASE_URL = "https://mcp-supabase.sylion.fr";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !MCP_AUTH_TOKEN) {
   console.error(
@@ -52,7 +53,6 @@ function issueOAuthToken() {
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = Date.now() + 3600 * 1000;
   oauthTokens.set(token, expiresAt);
-  // Cleanup expired tokens
   for (const [t, exp] of oauthTokens) {
     if (exp < Date.now()) oauthTokens.delete(t);
   }
@@ -108,7 +108,6 @@ function createMcpServer() {
     version: "1.0.0",
   });
 
-  // Tool: list_tables
   server.tool("list_tables", "List all available tables in Supabase", {}, async () => {
     return {
       content: [
@@ -117,7 +116,6 @@ function createMcpServer() {
     };
   });
 
-  // Tool: read_rows
   server.tool(
     "read_rows",
     "Read rows from a Supabase table with optional filters, column selection, ordering and limit",
@@ -155,7 +153,6 @@ function createMcpServer() {
     }
   );
 
-  // Tool: insert_rows
   server.tool(
     "insert_rows",
     "Insert one or more rows into a Supabase table",
@@ -192,7 +189,6 @@ function createMcpServer() {
     }
   );
 
-  // Tool: update_rows
   server.tool(
     "update_rows",
     "Update rows in a Supabase table matching the given filters",
@@ -233,7 +229,6 @@ function createMcpServer() {
     }
   );
 
-  // Tool: count_rows
   server.tool(
     "count_rows",
     "Count rows in a Supabase table with optional filters",
@@ -264,16 +259,22 @@ function createMcpServer() {
 }
 
 // --- Auth middleware (accepts static MCP_AUTH_TOKEN or OAuth-issued tokens) ---
+const WWW_AUTHENTICATE = `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`;
+
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing or invalid Authorization header" });
+    console.log(`Auth: rejected ${req.method} ${req.path} — no Bearer token`);
+    res.set("WWW-Authenticate", WWW_AUTHENTICATE);
+    return res.status(401).json({ error: "Unauthorized" });
   }
   const token = authHeader.slice(7);
   if (token === MCP_AUTH_TOKEN || isValidOAuthToken(token)) {
     return next();
   }
-  return res.status(403).json({ error: "Invalid token" });
+  console.log(`Auth: rejected ${req.method} ${req.path} — invalid token`);
+  res.set("WWW-Authenticate", WWW_AUTHENTICATE);
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
 // --- Express app ---
@@ -281,26 +282,29 @@ const app = express();
 app.use(express.json());
 
 // Health check (no auth)
-app.get("/", (_req, res) => {
-  res.json({ status: "ok", server: "mcp-supabase-sylion" });
-});
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", server: "mcp-supabase-sylion" });
 });
 
-// --- OAuth 2.0 endpoints (for Anthropic MCP connector) ---
+// --- OAuth 2.0 discovery endpoints (RFC 9728 + RFC 8414) ---
 
-// Authorization codes store (code -> { clientId, redirectUri, codeChallenge, codeChallengeMethod, expiresAt })
-const authCodes = new Map();
-
-// Discovery document
-app.get("/.well-known/oauth-authorization-server", (_req, res) => {
-  const baseUrl = `https://mcp-supabase.sylion.fr`;
+// Protected Resource Metadata (RFC 9728) — tells the client where the auth server is
+app.get("/.well-known/oauth-protected-resource", (_req, res) => {
   res.json({
-    issuer: baseUrl,
-    authorization_endpoint: `${baseUrl}/authorize`,
-    token_endpoint: `${baseUrl}/oauth/token`,
-    registration_endpoint: `${baseUrl}/oauth/register`,
+    resource: BASE_URL,
+    authorization_servers: [BASE_URL],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["mcp:tools"],
+  });
+});
+
+// Authorization Server Metadata (RFC 8414)
+app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+  res.json({
+    issuer: BASE_URL,
+    authorization_endpoint: `${BASE_URL}/authorize`,
+    token_endpoint: `${BASE_URL}/oauth/token`,
+    registration_endpoint: `${BASE_URL}/oauth/register`,
     token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
     grant_types_supported: ["authorization_code", "client_credentials"],
     response_types_supported: ["code"],
@@ -309,12 +313,13 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) => {
   });
 });
 
-// Dynamic client registration (MCP spec requirement)
-// Stores registered clients so the connector can use its own generated credentials
+// --- OAuth 2.0 endpoints ---
+
+const authCodes = new Map();
 const registeredClients = new Map();
 
+// Dynamic client registration (MCP spec requirement)
 app.post("/oauth/register", (req, res) => {
-  // Generate a client_id and client_secret for this registration
   const clientId = req.body.client_id || crypto.randomBytes(16).toString("hex");
   const clientSecret = crypto.randomBytes(32).toString("hex");
 
@@ -345,7 +350,6 @@ app.get("/authorize", (req, res) => {
     return res.status(400).json({ error: "unsupported_response_type" });
   }
 
-  // Accept configured client OR dynamically registered clients
   const isConfiguredClient = client_id === OAUTH_CLIENT_ID;
   const isRegisteredClient = registeredClients.has(client_id);
   if (!isConfiguredClient && !isRegisteredClient) {
@@ -355,17 +359,15 @@ app.get("/authorize", (req, res) => {
 
   console.log(`OAuth: authorize for client ${client_id}, redirect to ${redirect_uri}`);
 
-  // Generate authorization code
   const code = crypto.randomBytes(32).toString("hex");
   authCodes.set(code, {
     clientId: client_id,
     redirectUri: redirect_uri,
     codeChallenge: code_challenge,
     codeChallengeMethod: code_challenge_method || "plain",
-    expiresAt: Date.now() + 60 * 1000, // 1 min
+    expiresAt: Date.now() + 60 * 1000,
   });
 
-  // Auto-approve: redirect immediately with code
   const redirectUrl = new URL(redirect_uri);
   redirectUrl.searchParams.set("code", code);
   if (state) redirectUrl.searchParams.set("state", state);
@@ -390,7 +392,6 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
   const grantType = req.body.grant_type;
   console.log(`OAuth token: grant_type=${grantType}, client=${clientId}, content-type=${req.headers["content-type"]}`);
 
-  // --- Authorization code flow ---
   if (grantType === "authorization_code") {
     const { code, redirect_uri, code_verifier } = req.body;
     const stored = authCodes.get(code);
@@ -425,10 +426,9 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
     authCodes.delete(code);
     const { token, expiresIn } = issueOAuthToken();
     console.log("OAuth token: issued via authorization_code");
-    return res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
+    return res.json({ access_token: token, token_type: "Bearer", expires_in: expiresIn });
   }
 
-  // --- Client credentials flow ---
   if (grantType === "client_credentials") {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
       console.log("OAuth token: OAUTH_CLIENT_ID or OAUTH_CLIENT_SECRET not configured");
@@ -442,7 +442,7 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
     }
     const { token, expiresIn } = issueOAuthToken();
     console.log("OAuth token: issued via client_credentials");
-    return res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
+    return res.json({ access_token: token, token_type: "Bearer", expires_in: expiresIn });
   }
 
   console.log(`OAuth token: unsupported grant_type: ${grantType}`);
@@ -453,6 +453,7 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
 const sseSessions = {};
 
 app.get("/sse", authMiddleware, async (req, res) => {
+  console.log("SSE: new connection");
   const transport = new SSEServerTransport("/messages", res);
   sseSessions[transport.sessionId] = transport;
 
@@ -461,7 +462,6 @@ app.get("/sse", authMiddleware, async (req, res) => {
   };
 
   const server = createMcpServer();
-  // connect() calls start() internally, don't call start() separately
   await server.connect(transport);
 });
 
@@ -474,21 +474,22 @@ app.post("/messages", authMiddleware, async (req, res) => {
   await transport.handlePostMessage(req, res, req.body);
 });
 
-// --- Streamable HTTP transport (modern) ---
+// --- Streamable HTTP transport ---
 const streamableSessions = {};
 
-app.post("/mcp", authMiddleware, async (req, res) => {
+async function handleStreamablePost(req, res) {
   const sessionId = req.headers["mcp-session-id"];
+  console.log(`MCP transport: POST ${req.path}, session=${sessionId || "new"}`);
 
   if (sessionId && streamableSessions[sessionId]) {
     await streamableSessions[sessionId].handleRequest(req, res, req.body);
     return;
   }
 
-  // New session
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (id) => {
+      console.log(`MCP transport: session initialized ${id}`);
       streamableSessions[id] = transport;
     },
   });
@@ -502,25 +503,40 @@ app.post("/mcp", authMiddleware, async (req, res) => {
   const server = createMcpServer();
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
-});
+}
 
-app.get("/mcp", authMiddleware, async (req, res) => {
+async function handleStreamableGet(req, res) {
   const sessionId = req.headers["mcp-session-id"];
   if (sessionId && streamableSessions[sessionId]) {
     await streamableSessions[sessionId].handleRequest(req, res);
   } else {
     res.status(400).json({ error: "Invalid session" });
   }
-});
+}
 
-app.delete("/mcp", authMiddleware, async (req, res) => {
+async function handleStreamableDelete(req, res) {
   const sessionId = req.headers["mcp-session-id"];
   if (sessionId && streamableSessions[sessionId]) {
     await streamableSessions[sessionId].handleRequest(req, res);
   } else {
     res.status(400).json({ error: "Invalid session" });
   }
+}
+
+// Mount transport at root (Claude.ai POSTs to the server URL directly)
+app.post("/", authMiddleware, handleStreamablePost);
+app.delete("/", authMiddleware, handleStreamableDelete);
+app.get("/", (req, res) => {
+  if (req.headers["mcp-session-id"] || (req.headers.accept && req.headers.accept.includes("text/event-stream"))) {
+    return authMiddleware(req, res, () => handleStreamableGet(req, res));
+  }
+  res.json({ status: "ok", server: "mcp-supabase-sylion" });
 });
+
+// Mount transport at /mcp (backwards compatibility)
+app.post("/mcp", authMiddleware, handleStreamablePost);
+app.get("/mcp", authMiddleware, handleStreamableGet);
+app.delete("/mcp", authMiddleware, handleStreamableDelete);
 
 // --- REST API (for agents schedule that can't use MCP transport yet) ---
 
