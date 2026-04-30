@@ -313,7 +313,7 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) => {
 // Stores registered clients so the connector can use its own generated credentials
 const registeredClients = new Map();
 
-app.post("/oauth/register", authMiddleware, (req, res) => {
+app.post("/oauth/register", (req, res) => {
   // Generate a client_id and client_secret for this registration
   const clientId = req.body.client_id || crypto.randomBytes(16).toString("hex");
   const clientSecret = crypto.randomBytes(32).toString("hex");
