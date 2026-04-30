@@ -343,11 +343,29 @@ app.post("/oauth/register", (req, res) => {
 });
 
 // Authorization endpoint (auto-approves and redirects with code)
+const ALLOWED_REDIRECT_HOSTS = ["claude.ai"];
+
+function isAllowedRedirectUri(uri) {
+  try {
+    const url = new URL(uri);
+    return ALLOWED_REDIRECT_HOSTS.some(
+      (d) => url.hostname === d || url.hostname.endsWith(`.${d}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
 app.get("/authorize", (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
 
   if (response_type !== "code") {
     return res.status(400).json({ error: "unsupported_response_type" });
+  }
+
+  if (!isAllowedRedirectUri(redirect_uri)) {
+    console.log(`OAuth: rejected redirect_uri ${redirect_uri} — not in allowlist`);
+    return res.status(400).json({ error: "invalid_redirect_uri" });
   }
 
   const isConfiguredClient = client_id === OAUTH_CLIENT_ID;
@@ -435,9 +453,7 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
       return res.status(500).json({ error: "server_error" });
     }
     const isConfigured = clientId === OAUTH_CLIENT_ID && clientSecret === OAUTH_CLIENT_SECRET;
-    const registered = registeredClients.get(clientId);
-    const isRegistered = registered && registered.clientSecret === clientSecret;
-    if (!isConfigured && !isRegistered) {
+    if (!isConfigured) {
       return res.status(401).json({ error: "invalid_client" });
     }
     const { token, expiresIn } = issueOAuthToken();
