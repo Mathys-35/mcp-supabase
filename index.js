@@ -26,6 +26,33 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !MCP_AUTH_TOKEN) {
   process.exit(1);
 }
 
+// --- Table allowlist (defense-in-depth: blocks access to system tables) ---
+const DEFAULT_TABLES = [
+  "prospection_immobilier",
+  "prospection_recrutement",
+  "config",
+  "linkedin_posts",
+  "linkedin_themes",
+  "linkedin_viral_patterns",
+  "linkedin_hook_library",
+  "linkedin_veille",
+  "linkedin_idees",
+  "linkedin_engagement",
+  "linkedin_lead_magnets",
+];
+
+const ALLOWED_TABLES = new Set(
+  process.env.ALLOWED_TABLES
+    ? process.env.ALLOWED_TABLES.split(",").map((t) => t.trim())
+    : DEFAULT_TABLES
+);
+
+function validateTable(table) {
+  if (!ALLOWED_TABLES.has(table)) {
+    throw new Error(`Access denied: table "${table}" is not in the allowlist`);
+  }
+}
+
 // --- OAuth token store (in-memory, tokens expire after 1h) ---
 const oauthTokens = new Map();
 
@@ -91,28 +118,9 @@ function createMcpServer() {
 
   // Tool: list_tables
   server.tool("list_tables", "List all available tables in Supabase", {}, async () => {
-    const tables = await supabaseRequest("GET", "/?select=*", {
-      headers: { Accept: "application/json" },
-    }).catch(async () => {
-      // Fallback: query pg_tables via PostgREST RPC if available, or use known tables
-      const knownTables = [
-        "prospection_immobilier",
-        "prospection_recrutement",
-        "config",
-        "linkedin_posts",
-        "linkedin_themes",
-        "linkedin_viral_patterns",
-        "linkedin_hook_library",
-        "linkedin_veille",
-        "linkedin_idees",
-        "linkedin_engagement",
-        "linkedin_lead_magnets",
-      ];
-      return knownTables;
-    });
     return {
       content: [
-        { type: "text", text: JSON.stringify(tables, null, 2) },
+        { type: "text", text: JSON.stringify([...ALLOWED_TABLES], null, 2) },
       ],
     };
   });
@@ -140,6 +148,7 @@ function createMcpServer() {
       limit: z.number().optional().describe("Max rows to return (default: 100)"),
     },
     async ({ table, filters, select, order, limit }) => {
+      validateTable(table);
       let path = `/${encodeURIComponent(table)}?select=${select || "*"}`;
       const filterQuery = buildFilterQuery(filters);
       if (filterQuery) path += `&${filterQuery}`;
@@ -169,6 +178,7 @@ function createMcpServer() {
         .describe("Return inserted rows (default: false)"),
     },
     async ({ table, rows, return_rows }) => {
+      validateTable(table);
       const path = `/${encodeURIComponent(table)}`;
       const headers = {};
       if (return_rows) headers["Prefer"] = "return=representation";
@@ -208,6 +218,7 @@ function createMcpServer() {
         .describe("Return updated rows (default: false)"),
     },
     async ({ table, filters, data, return_rows }) => {
+      validateTable(table);
       let path = `/${encodeURIComponent(table)}?`;
       path += buildFilterQuery(filters);
       const headers = {};
@@ -242,6 +253,7 @@ function createMcpServer() {
         .describe("PostgREST filters as key-value pairs"),
     },
     async ({ table, filters }) => {
+      validateTable(table);
       let path = `/${encodeURIComponent(table)}?select=count`;
       const filterQuery = buildFilterQuery(filters);
       if (filterQuery) path += `&${filterQuery}`;
@@ -306,7 +318,7 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) => {
 // Stores registered clients so the connector can use its own generated credentials
 const registeredClients = new Map();
 
-app.post("/oauth/register", (req, res) => {
+app.post("/oauth/register", authMiddleware, (req, res) => {
   // Generate a client_id and client_secret for this registration
   const clientId = req.body.client_id || crypto.randomBytes(16).toString("hex");
   const clientSecret = crypto.randomBytes(32).toString("hex");
@@ -518,6 +530,7 @@ app.get("/api/read_rows", authMiddleware, async (req, res) => {
   try {
     const { table, select, order, limit, ...filters } = req.query;
     if (!table) return res.status(400).json({ error: "table is required" });
+    validateTable(table);
     let path = `/${encodeURIComponent(table)}?select=${select || "*"}`;
     const filterQuery = buildFilterQuery(filters);
     if (filterQuery) path += `&${filterQuery}`;
@@ -535,6 +548,7 @@ app.post("/api/insert_rows", authMiddleware, async (req, res) => {
     const { table, rows, return_rows } = req.body;
     if (!table || !rows)
       return res.status(400).json({ error: "table and rows are required" });
+    validateTable(table);
     const path = `/${encodeURIComponent(table)}`;
     const headers = {};
     headers["Prefer"] = return_rows ? "return=representation" : "return=minimal";
@@ -552,6 +566,7 @@ app.patch("/api/update_rows", authMiddleware, async (req, res) => {
       return res
         .status(400)
         .json({ error: "table, filters and data are required" });
+    validateTable(table);
     let path = `/${encodeURIComponent(table)}?`;
     path += buildFilterQuery(filters);
     const headers = {};
@@ -570,6 +585,7 @@ app.get("/api/count_rows", authMiddleware, async (req, res) => {
   try {
     const { table, ...filters } = req.query;
     if (!table) return res.status(400).json({ error: "table is required" });
+    validateTable(table);
     let path = `/${encodeURIComponent(table)}?select=count`;
     const filterQuery = buildFilterQuery(filters);
     if (filterQuery) path += `&${filterQuery}`;
