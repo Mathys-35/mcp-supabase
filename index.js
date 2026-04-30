@@ -281,6 +281,9 @@ const app = express();
 app.use(express.json());
 
 // Health check (no auth)
+app.get("/", (_req, res) => {
+  res.json({ status: "ok", server: "mcp-supabase-sylion" });
+});
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", server: "mcp-supabase-sylion" });
 });
