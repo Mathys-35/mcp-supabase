@@ -31,14 +31,6 @@ const DEFAULT_TABLES = [
   "prospection_immobilier",
   "prospection_recrutement",
   "config",
-  "linkedin_posts",
-  "linkedin_themes",
-  "linkedin_viral_patterns",
-  "linkedin_hook_library",
-  "linkedin_veille",
-  "linkedin_idees",
-  "linkedin_engagement",
-  "linkedin_lead_magnets",
 ];
 
 const ALLOWED_TABLES = new Set(
