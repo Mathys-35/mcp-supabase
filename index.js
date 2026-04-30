@@ -376,7 +376,6 @@ app.get("/authorize", (req, res) => {
 app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => {
   let clientId, clientSecret;
 
-  // Extract client credentials (Basic auth or POST body)
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Basic ")) {
     const decoded = Buffer.from(authHeader.slice(6), "base64").toString();
@@ -389,10 +388,7 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
   }
 
   const grantType = req.body.grant_type;
-
-  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
-    return res.status(500).json({ error: "server_error" });
-  }
+  console.log(`OAuth token: grant_type=${grantType}, client=${clientId}, content-type=${req.headers["content-type"]}`);
 
   // --- Authorization code flow ---
   if (grantType === "authorization_code") {
@@ -400,11 +396,11 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
     const stored = authCodes.get(code);
 
     if (!stored || stored.expiresAt < Date.now()) {
+      console.log("OAuth token: invalid or expired auth code");
       authCodes.delete(code);
       return res.status(400).json({ error: "invalid_grant" });
     }
 
-    // Verify PKCE code_verifier if code_challenge was provided
     if (stored.codeChallenge) {
       let valid = false;
       if (stored.codeChallengeMethod === "S256") {
@@ -414,25 +410,30 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
         valid = code_verifier === stored.codeChallenge;
       }
       if (!valid) {
+        console.log("OAuth token: PKCE verification failed");
         authCodes.delete(code);
         return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
       }
     }
 
-    // Verify redirect_uri matches
     if (stored.redirectUri && redirect_uri !== stored.redirectUri) {
+      console.log(`OAuth token: redirect_uri mismatch: ${redirect_uri} vs ${stored.redirectUri}`);
       authCodes.delete(code);
       return res.status(400).json({ error: "invalid_grant" });
     }
 
     authCodes.delete(code);
     const { token, expiresIn } = issueOAuthToken();
+    console.log("OAuth token: issued via authorization_code");
     return res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
   }
 
   // --- Client credentials flow ---
   if (grantType === "client_credentials") {
-    // Accept configured client OR dynamically registered clients
+    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
+      console.log("OAuth token: OAUTH_CLIENT_ID or OAUTH_CLIENT_SECRET not configured");
+      return res.status(500).json({ error: "server_error" });
+    }
     const isConfigured = clientId === OAUTH_CLIENT_ID && clientSecret === OAUTH_CLIENT_SECRET;
     const registered = registeredClients.get(clientId);
     const isRegistered = registered && registered.clientSecret === clientSecret;
@@ -440,9 +441,11 @@ app.post("/oauth/token", express.urlencoded({ extended: false }), (req, res) => 
       return res.status(401).json({ error: "invalid_client" });
     }
     const { token, expiresIn } = issueOAuthToken();
+    console.log("OAuth token: issued via client_credentials");
     return res.json({ access_token: token, token_type: "bearer", expires_in: expiresIn });
   }
 
+  console.log(`OAuth token: unsupported grant_type: ${grantType}`);
   return res.status(400).json({ error: "unsupported_grant_type" });
 });
 
