@@ -3,7 +3,7 @@ FROM node:22-alpine
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN apk add --no-cache wget && npm ci --production
+RUN apk add --no-cache curl wget && npm ci --production
 
 COPY index.js ./
 
